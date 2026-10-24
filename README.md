@@ -39,18 +39,38 @@ docs/使用说明.txt            面向使用者的简明说明
 docs/DeepSeek-Harness-使用教程.md      11 章图文教程
 docs/使用教程（温克Baby）.pdf          同一教程的 PDF 版
 docs/images/                教程配图
-release/DeepSeekHarness-0.2.1-rc.2-fnos-x86.fpk   可直接安装的整包
 ```
+
+> **可安装的 fpk 在 [Releases](https://github.com/wenk12138baby/dsh-fnos/releases) 里**，
+> 不放在仓库中（84 MB，超出常规仓库文件的合理体积）。
 
 ---
 
 ## 安装
 
-### 方式一：直接装 fpk
+### 方式一：直接装 fpk（推荐）
 
-1. 下载 [`release/DeepSeekHarness-0.2.1-rc.2-fnos-x86.fpk`](release/DeepSeekHarness-0.2.1-rc.2-fnos-x86.fpk)
+1. 到 [Releases](https://github.com/wenk12138baby/dsh-fnos/releases/tag/v0.2.1-rc.2) 下载 `DeepSeekHarness-0.2.1-rc.2-fnos-x86.fpk`
 2. 飞牛 → 应用中心 → 手动安装 → 选择该文件
 3. 装完在桌面点开应用
+
+**直链：**
+
+```
+https://github.com/wenk12138baby/dsh-fnos/releases/download/v0.2.1-rc.2/DeepSeekHarness-0.2.1-rc.2-fnos-x86.fpk
+```
+
+**校验：**
+
+| 项 | 值 |
+|---|---|
+| 大小 | 88,231,135 字节（84.1 MB） |
+| SHA256 | `9669E8A8BE77B287DC47A68B106098F73F6A15CAC65D9423AC94AA7D1DF7097B` |
+
+```bash
+# 下载后校验
+sha256sum DeepSeekHarness-0.2.1-rc.2-fnos-x86.fpk
+```
 
 ### 方式二：从本仓库的文件自行打包
 
