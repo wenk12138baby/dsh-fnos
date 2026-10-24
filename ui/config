@@ -1,0 +1,16 @@
+{
+    ".url": {
+        "DeepSeekHarness.Application": {
+            "title": "DeepSeek Harness",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "http",
+            "port": "${wizard_port}",
+            "url": "/",
+            "allUsers": false,
+            "control": {
+                "accessPerm": "readonly"
+            }
+        }
+    }
+}
