@@ -1,0 +1,32 @@
+# 系统与运行时
+app.sock
+*.sock
+*.pid
+*.log
+
+# 用户数据（绝不入库）
+**/@apphome/**
+**/@appdata/**
+**/@appconf/**
+.credentials.yaml
+cordis.patch.yml.bak
+
+# 依赖
+node_modules/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*~
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 临时
+tmp/
+.tmp/
+.cache/
+*.tmp
