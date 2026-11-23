@@ -1,0 +1,38 @@
+#!/bin/bash
+# ============================================================================
+#  config_callback —— 应用设置变更后执行
+# ============================================================================
+#  1. 把新端口同步进 ui/config，否则飞牛桌面图标仍指向旧端口，点开就是
+#     打不开的页面。ui/config 里的 port 必须写具体数字（用 ${wizard_port}
+#     这类变量飞牛不解析，直接导致桌面不生成图标）。
+#  2. 重启服务，让新端口/新选项生效。
+#
+#  用 `bash main` 而非 `./main`：fpk 内脚本无执行位。
+# ============================================================================
+
+set -u
+
+# ── 同步端口到桌面入口配置 ──────────────────────────────────────────────────
+UI_CONF="${TRIM_APPDEST}/ui/config"
+NEW_PORT="${wizard_port:-}"
+case "${NEW_PORT}" in
+    ''|*[!0-9]*) NEW_PORT="" ;;
+esac
+
+if [ -n "${NEW_PORT}" ] && [ -f "${UI_CONF}" ]; then
+    # 只改 port 那一行，保留其余结构不动。
+    if grep -q '"port"' "${UI_CONF}" 2>/dev/null; then
+        cp "${UI_CONF}" "${UI_CONF}.bak" 2>/dev/null || true
+        sed -i "s|\"port\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"port\": \"${NEW_PORT}\"|" "${UI_CONF}" 2>/dev/null || true
+        chmod 644 "${UI_CONF}" 2>/dev/null || true
+        echo "已同步桌面入口端口为 ${NEW_PORT}"
+    fi
+fi
+
+# ── 重启服务 ────────────────────────────────────────────────────────────────
+if [ -f "${TRIM_APPDEST}/cmd/main" ]; then
+    bash "${TRIM_APPDEST}/cmd/main" stop >/dev/null 2>&1 || true
+    bash "${TRIM_APPDEST}/cmd/main" start >/dev/null 2>&1 || true
+fi
+
+exit 0
