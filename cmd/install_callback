@@ -1,0 +1,405 @@
+#!/bin/bash
+# ============================================================================
+#  install_callback —— 应用文件落盘后执行
+# ============================================================================
+#  做三件事：
+#    1. 检查/记录可用的 Node 运行时
+#    2. 初始化 DSH_HOME（profile 目录）并把 fnOS 插件写进 home patch
+#    3. 生成默认配置文件
+#
+#  幂等：重复执行不破坏已有数据。升级时保留用户的 profile 与设置。
+# ============================================================================
+
+set -u
+
+# ── 路径解析 ────────────────────────────────────────────────────────────────
+# 与 cmd/main 一致：正常由 fnOS 注入 TRIM_*，手动执行时从脚本位置反推，
+# 避免 set -u 下 unbound variable 崩掉。
+SELF_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+APP_DEST="${TRIM_APPDEST:-}"
+if [ -z "${APP_DEST}" ]; then
+    if [ -n "${SELF_DIR}" ] && [ -d "${SELF_DIR}/../gateway" ]; then
+        APP_DEST=$(cd "${SELF_DIR}/.." && pwd)
+    else
+        APP_DEST=/var/apps/DeepSeekHarness
+    fi
+fi
+export TRIM_APPDEST="${APP_DEST}"
+
+resolve_dir() {
+    local link="$1" fallback="$2"
+    if [ -d "${link}" ]; then
+        readlink -f "${link}" 2>/dev/null || echo "${fallback}"
+    else
+        echo "${fallback}"
+    fi
+}
+
+APP_HOME="${TRIM_PKGHOME:-$(resolve_dir "${APP_DEST}/home" "${APP_DEST}/../home")}"
+APP_VAR="${TRIM_PKGVAR:-$(resolve_dir "${APP_DEST}/var" "${APP_DEST}/../var")}"
+APP_ETC="${TRIM_PKGETC:-$(resolve_dir "${APP_DEST}/etc" "${APP_DEST}/../etc")}"
+
+mkdir -p "${APP_HOME}" "${APP_VAR}" "${APP_ETC}"
+
+# ── 1. 记录 Node 运行时选择结果，供 main 与排障使用 ──────────────────────────
+# 用 bash 显式解释执行，不依赖可执行位（fpk 内脚本权限是 644）。
+NODE_BIN=$(bash "${APP_DEST}/scripts/detect-node.sh" 2>/dev/null || true)
+if [ -n "${NODE_BIN}" ]; then
+    NODE_VER=$("${NODE_BIN}" --version 2>/dev/null)
+    echo "node_bin=${NODE_BIN}" > "${APP_ETC}/runtime.env"
+    echo "node_version=${NODE_VER}" >> "${APP_ETC}/runtime.env"
+    echo "使用 Node 运行时：${NODE_BIN}（${NODE_VER}）"
+else
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "未找到可用的 Node.js 24.2+ 运行时。请在应用中心安装 Node.js v24，或使用内置运行时版本的安装包。" >> "${TRIM_TEMP_LOGFILE}"
+    fi
+    echo "警告：未找到可用的 Node 运行时" >&2
+fi
+
+# ── 2. 初始化 DSH_HOME ───────────────────────────────────────────────────────
+# DSH 首次启动会自己创建 profile；这里预置 home patch，把 fnOS 插件挂进去。
+#
+# 用**绝对路径**而不是包名：DSH 的 Loader 从 profile 目录
+# （$DSH_HOME/profiles/<name>/）解析 patch 里的 `name:`，而 profile 目录默认
+# 没有 node_modules，包名解析必然失败：
+#   Cannot find package 'dsh-fnos-plugin' imported from .../profiles/web/
+# 绝对路径由 file:// URL 直接加载，不经过包解析，稳定得多。
+PATCH_FILE="${APP_HOME}/cordis.patch.yml"
+PLUGIN_ENTRY="file://${APP_DEST}/dsh/node_modules/dsh-fnos-plugin/index.js"
+
+if [ ! -f "${PATCH_FILE}" ]; then
+    cat > "${PATCH_FILE}" <<PATCH
+# DeepSeek Harness — 飞牛 fnOS 集成
+#
+# 这个文件是 home 级补丁层，对所有 profile 生效。
+# 它把内置的 fnOS 插件挂进每一个 DSH 会话：
+#   - 系统提示词里声明「运行在飞牛 NAS 上」
+#   - 注册 fnos_system_info / fnos_list_apps / fnos_storage 三个只读工具
+#
+# 用绝对路径加载：profile 目录默认没有 node_modules，包名解析会失败。
+# 升级应用时路径不变（应用总是装在 @appcenter/DeepSeekHarness），无需改这里。
+#
+# 卸载本应用不会删除这个文件；如需彻底清理请手动移除本目录。
+
+- insert:
+    - id: fnos-integration
+      name: ${PLUGIN_ENTRY}
+      config:
+        promptSection: true
+        tools: true
+        appsDir: /var/apps
+PATCH
+    chmod 644 "${PATCH_FILE}"
+    echo "已创建 home patch：${PATCH_FILE}"
+    echo "  插件入口：${PLUGIN_ENTRY}"
+else
+    echo "保留已有 home patch：${PATCH_FILE}"
+    # 旧版本写的是包名（dsh-fnos-plugin），在 profile 目录下解析不到。
+    # 检测到这种写法就就地迁移成绝对路径，避免升级后插件继续失效。
+    if grep -qE '^\s*name:\s*dsh-fnos-plugin\s*$' "${PATCH_FILE}" 2>/dev/null; then
+        cp "${PATCH_FILE}" "${PATCH_FILE}.bak" 2>/dev/null || true
+        sed -i "s|^\(\s*name:\s*\)dsh-fnos-plugin\s*\$|\1${PLUGIN_ENTRY}|" "${PATCH_FILE}" 2>/dev/null || true
+        echo "已把 home patch 的插件引用从包名迁移为绝对路径（原文件备份为 .bak）"
+    fi
+    # 旧版本在这里硬编码了 volumesRoot: /vol，但 fnOS 的卷挂在 /vol1、/vol5
+    # 这类带卷号的路径下，/vol 往往不存在 —— fnos_storage 因此恒定报
+    #   ENOENT: no such file or directory, scandir '/vol'
+    # 现在插件会自己探测卷根，这一行反而会把它覆盖成错的值，必须移除。
+    # 只删这一行，保留用户可能手工加过的其他配置。
+    if grep -qE '^[[:space:]]*volumesRoot:[[:space:]]*/vol[[:space:]]*$' "${PATCH_FILE}" 2>/dev/null; then
+        cp "${PATCH_FILE}" "${PATCH_FILE}.bak-volroot" 2>/dev/null || true
+        sed -i '/^[[:space:]]*volumesRoot:[[:space:]]*\/vol[[:space:]]*$/d' "${PATCH_FILE}" 2>/dev/null || true
+        echo "已移除 home patch 中失效的 volumesRoot: /vol（改为插件自动探测卷根，原文件备份为 .bak-volroot）"
+    fi
+fi
+
+# ── 3. 安装 fnOS 插件到 profile 的 node_modules ──────────────────────────────
+#
+# 关键：DSH 的 Loader 从 **profile 目录**（$DSH_HOME/profiles/<name>/）解析
+# patch 里 insert 的插件包名，而不是从 dsh 安装目录。
+# 实测报错：
+#   Cannot find package 'dsh-fnos-plugin' imported from
+#   <卷>/@apphome/DeepSeekHarness/profiles/web/
+# 所以必须把插件放进 profile 自己的 node_modules，只放在
+# app/dsh/node_modules 是不够的（那是给 bundle 解析用的）。
+#
+# profile 目录在 DSH 首次启动时才创建，这里预先建好并把插件放进去；
+# initProfile 是「文件已存在就不动」的语义，所以预建不会冲突。
+install_plugin_into_profile() {
+    local profile_dir="$1"
+    local plugin_src="${APP_DEST}/dsh/node_modules/dsh-fnos-plugin"
+    local plugin_dst="${profile_dir}/node_modules/dsh-fnos-plugin"
+
+    [ -d "${plugin_src}" ] || { echo "插件源不存在：${plugin_src}" >&2; return 1; }
+
+    mkdir -p "${profile_dir}/node_modules" 2>/dev/null || return 1
+    rm -rf "${plugin_dst}" 2>/dev/null || true
+    cp -R "${plugin_src}" "${plugin_dst}" 2>/dev/null || return 1
+    echo "已安装插件到 ${plugin_dst}"
+}
+
+# DSH 的 web profile 是主要入口；其余 profile 也一并装上，便于用户自行切换。
+for profile in web headless tui; do
+    install_plugin_into_profile "${APP_HOME}/profiles/${profile}" || \
+        echo "警告：无法为 profile ${profile} 安装插件" >&2
+done
+
+# ── 3d. 安装 fnOS 面板插件（跨设备访问 / 账号登录）──────────────────────────
+# 这个插件在侧栏账号上方提供「跨设备访问」入口，点击弹出面板：
+#   - 带令牌的直连链接（IP 取浏览器、端口取服务端，用户改端口也不会错）
+#   - DeepSeek 账号登录（粘贴回调地址完成）
+# 它同时有 Host 与 Client 两面，必须注册进 profile 的 bundles 才会被加载。
+install_fnos_panel() {
+    local profile_dir="$1"
+    local src="${APP_DEST}/dsh-fnos-panel"
+    local dst="${profile_dir}/node_modules/dsh-fnos-panel"
+
+    [ -d "${src}" ] || return 0
+    mkdir -p "${profile_dir}/node_modules" 2>/dev/null || return 1
+    rm -rf "${dst}" 2>/dev/null || true
+    cp -R "${src}" "${dst}" 2>/dev/null || return 1
+
+    # 注册到 profile 的 bundles（幂等：已存在就跳过）
+    #
+    # ★ 时序坑（全新安装实测踩到）：
+    #   profiles/<name>/package.json 是 dsh 首次启动时才创建的，安装阶段不存在。
+    #   之前只在「文件存在时」注册 → 被静默跳过 → dsh 首次启动自建 package.json
+    #   只带默认 bundles，侧栏面板消失（用户报「装好了但没有注意事项」）。
+    #
+    # ★ 预置时必须带基础 bundle（这一条踩过大坑）：
+    #   dsh 的服务（webServer / credentials / systemPrompt / tools…）全部由
+    #   @deepseek-ai/dsh-base 与 dsh-web-app 提供。若预置的 bundles 只有
+    #   dsh-fnos-panel，插件会全部 pending（waiting for services），
+    #   dsh 直接以 code=0 退出，表现为「启动失败：端口 3080 无监听」。
+    #
+    #   因此：只给 web profile 预置，且 bundles 必须 =
+    #     @deepseek-ai/dsh-base + @deepseek-ai/dsh-web-app + dsh-fnos-panel
+    #   headless / tui 不预置 —— dsh 对这些 profile 有自己的默认值，
+    #   我们不该猜（猜错同样会导致启动失败）。
+    local prof_name
+    prof_name=$(basename "${profile_dir}")
+    local pkgjson="${profile_dir}/package.json"
+
+    if [ ! -f "${pkgjson}" ] && [ "${prof_name}" = "web" ]; then
+        cat > "${pkgjson}" <<PJSON
+{
+  "name": "dsh-profile-web",
+  "private": true,
+  "dependencies": {},
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-fnos-panel"
+      ]
+    }
+  }
+}
+PJSON
+        chmod 644 "${pkgjson}" 2>/dev/null || true
+        echo "已预置 web profile 的 package.json（dsh-base + dsh-web-app + dsh-fnos-panel）"
+    elif [ -f "${pkgjson}" ] && command -v python3 >/dev/null 2>&1; then
+        python3 - "$pkgjson" <<'PYEOF' 2>&1 | grep -v '^$' || true
+import json, sys
+p = sys.argv[1]
+try:
+    d = json.load(open(p, encoding='utf-8'))
+except Exception as e:
+    print("  注册失败（JSON 解析）:", e)
+    sys.exit(0)
+bundles = d.setdefault('dsh', {}).setdefault('profile', {}).setdefault('bundles', [])
+if 'dsh-fnos-panel' not in bundles:
+    bundles.append('dsh-fnos-panel')
+    try:
+        json.dump(d, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+        print("  已把 dsh-fnos-panel 注册进 bundles")
+    except Exception as e:
+        print("  注册失败（写回）:", e)
+PYEOF
+    fi
+    echo "已安装 fnOS 面板插件到 ${dst}"
+    return 0
+}
+
+for profile in web headless tui; do
+    install_fnos_panel "${APP_HOME}/profiles/${profile}" || \
+        echo "警告：无法为 profile ${profile} 安装 fnOS 面板插件" >&2
+done
+
+# ── 3c. 给 profile 补齐 peer 依赖 ────────────────────────────────────────────
+# 第三方插件（如 dsh-connect-workbuddy）把 dsh 的核心包声明为 peerDependencies，
+# 而 profile 的 .npmrc 设了 `autoInstallPeers: false`，所以这些包不会被装进
+# profile 的 node_modules。插件运行时从 profile 目录解析依赖，找不到就报：
+#   Cannot find package '@earendil-works/pi-ai' imported from
+#   .../profiles/web/node_modules/dsh-connect-workbuddy/lib/index.js
+# 表现是插件页面全部报错、无法使用。
+#
+# 修法：把宿主（dsh/node_modules）里已有的这些包软链到 profile 下。
+# 用软链而不是拷贝，是为了跟宿主保持同一份 —— 升级 dsh 时会自动跟着更新。
+link_peers_into_profile() {
+    local profile_dir="$1"
+    local host_nm="${APP_DEST}/dsh/node_modules"
+    local prof_nm="${profile_dir}/node_modules"
+    [ -d "${prof_nm}" ] || return 0
+
+    local count=0 pkg
+    for pkg in \
+        "@earendil-works/pi-ai" \
+        "@earendil-works/pi-schema" \
+        "@earendil-works/pi-telemetry" \
+        "@deepseek-ai/cordis" \
+        "@deepseek-ai/dsh-llm" \
+        "@deepseek-ai/dsh-llm-pi-ai" \
+        "@deepseek-ai/dsh-home-paths" \
+        "@deepseek-ai/dsh-settings" \
+        "@deepseek-ai/dsh-atomic-write" \
+        "@deepseek-ai/dsh-attachment" \
+        "@deepseek-ai/dsh-host-webserver" \
+        "@deepseek-ai/dsh-client-ui-primitives" \
+        "@deepseek-ai/dsh-client-ui-renderer" \
+        "@deepseek-ai/dsh-client-ui-settings"; do
+        [ -d "${host_nm}/${pkg}" ] || continue
+        [ -e "${prof_nm}/${pkg}" ] && continue
+        mkdir -p "$(dirname "${prof_nm}/${pkg}")" 2>/dev/null || continue
+        ln -s "${host_nm}/${pkg}" "${prof_nm}/${pkg}" 2>/dev/null && count=$((count + 1))
+    done
+    [ -d "${host_nm}/react" ] && [ ! -e "${prof_nm}/react" ] && \
+        ln -s "${host_nm}/react" "${prof_nm}/react" 2>/dev/null && count=$((count + 1))
+    echo "已为 profile 补齐 ${count} 个 peer 依赖"
+    return 0
+}
+
+for profile in web headless tui; do
+    link_peers_into_profile "${APP_HOME}/profiles/${profile}"
+done
+
+# ── 3b. 备份 fnos 插件 ───────────────────────────────────────────────────────
+# dsh-fnos-plugin 不在 dsh 的依赖树里（npm ls 会显示 extraneous），
+# 一次 `npm prune` 或升级时的 `npm ci` 就会把它物理删除；插件市场装卸插件
+# 也可能冲掉 cordis.patch.yml 里的挂载行。这两种情况都会让
+# fnos_system_info / fnos_list_apps / fnos_storage 三个工具**静默消失**。
+#
+# 备份到 @appdata（不属于 node_modules，不会被 npm 清理），
+# cmd/main 启动前会自动比对并从备份恢复。
+PLUGIN_SRC="${APP_DEST}/dsh/node_modules/dsh-fnos-plugin"
+PLUGIN_BACKUP="${APP_VAR}/plugin-backup"
+if [ -d "${PLUGIN_SRC}" ]; then
+    mkdir -p "${PLUGIN_BACKUP}" 2>/dev/null || true
+    rm -rf "${PLUGIN_BACKUP}/dsh-fnos-plugin" 2>/dev/null || true
+    cp -r "${PLUGIN_SRC}" "${PLUGIN_BACKUP}/" 2>/dev/null \
+        && echo "已备份 fnos 插件到 ${PLUGIN_BACKUP}" \
+        || echo "警告：fnos 插件备份失败" >&2
+fi
+
+# ── 4. 默认配置 ──────────────────────────────────────────────────────────────
+CONF="${APP_ETC}/config.conf"
+if [ ! -f "${CONF}" ]; then
+    # 向导里的「仅管理员可访问」开关（wizard_enforce_admin）真正落到这里。
+    # 之前这个字段在向导里存在，但没有任何脚本读它，等于摆设。
+    case "${wizard_enforce_admin:-true}" in
+        false|0|no|off|False|FALSE) ADMIN_FLAG=0 ;;
+        *) ADMIN_FLAG=1 ;;
+    esac
+    cat > "${CONF}" <<CONF
+# DeepSeek Harness 应用配置
+# 修改后请在应用设置中保存，或重启应用生效。
+
+# 网关公开路径前缀，必须与 app/ui/config 的 gatewayPrefix 一致
+GATEWAY_PREFIX=/app/DeepSeekHarness
+
+# 是否只允许管理员访问（1=是，0=否）
+# 由安装向导的「仅管理员可访问」开关决定；也可直接改这里后重启应用。
+ENFORCE_ADMIN=${ADMIN_FLAG}
+CONF
+    chmod 644 "${CONF}"
+    echo "已创建默认配置：${CONF}（ENFORCE_ADMIN=${ADMIN_FLAG}）"
+fi
+
+# 读取配置，供本脚本与 cmd/main 使用。
+if [ -f "${CONF}" ]; then
+    # shellcheck disable=SC1090
+    . "${CONF}" 2>/dev/null || true
+fi
+export ENFORCE_ADMIN="${ENFORCE_ADMIN:-1}"
+export GATEWAY_PREFIX="${GATEWAY_PREFIX:-/app/DeepSeekHarness}"
+
+# ── 5. 固定 launch token ─────────────────────────────────────────────────────
+#
+# DSH 每次启动会随机生成 launch token，重启后旧的访问链接就失效。
+# 把它固定下来，网关才能在「用户没有 cookie」时自动完成无感登录，
+# 用户也永远不会看到需要手动拼 ?token= 的场景。
+#
+# 只在文件不存在时生成，保证重启/升级后 token 稳定。
+TOKEN_FILE="${APP_VAR}/launch-token.env"
+if [ ! -f "${TOKEN_FILE}" ]; then
+    # 32 字节随机数，base64url（DSH 只接受 [A-Za-z0-9_-]）。
+    if command -v openssl >/dev/null 2>&1; then
+        NEW_TOKEN=$(openssl rand -base64 32 2>/dev/null | tr -d '\n=' | tr '+/' '-_')
+    elif command -v head >/dev/null 2>&1 && [ -r /dev/urandom ]; then
+        NEW_TOKEN=$(head -c 32 /dev/urandom | base64 2>/dev/null | tr -d '\n=' | tr '+/' '-_')
+    fi
+    case "${NEW_TOKEN:-}" in
+        ''|*[!A-Za-z0-9_-]*)
+            # 兜底：用日期+随机数拼一个合法 token，避免安装因为取随机失败而中断
+            NEW_TOKEN="dshfnos$(date +%s)$$"
+            ;;
+    esac
+    mkdir -p "${APP_VAR}"
+    cat > "${TOKEN_FILE}" <<TOKEN
+# DeepSeek Harness — 固定 launch token
+#
+# 这个值用于「点开应用自动登录」。删除本文件后重启应用会生成新令牌，
+# 所有已登录的浏览器会自动重新登录一次（用户无需任何操作）。
+DSH_LAUNCH_TOKEN=${NEW_TOKEN}
+TOKEN
+    chmod 600 "${TOKEN_FILE}" 2>/dev/null || true
+    echo "已生成固定启动令牌：${TOKEN_FILE}"
+else
+    echo "保留已有启动令牌：${TOKEN_FILE}"
+fi
+
+# ── 5b. 同步端口到桌面入口配置 ──────────────────────────────────────────────
+# ui/config 的 port 必须写具体数字。写成 ${wizard_port} 这类模板变量时，
+# 飞牛桌面不会替换它，结果就是「桌面没有图标、只能通过 web 地址访问」。
+# 这里按安装向导里实际填写的端口改写一次。
+UI_CONF="${APP_DEST}/ui/config"
+INSTALL_PORT="${wizard_port:-}"
+case "${INSTALL_PORT}" in
+    ''|*[!0-9]*) INSTALL_PORT="${TRIM_SERVICE_PORT:-3080}" ;;
+esac
+case "${INSTALL_PORT}" in
+    ''|*[!0-9]*) INSTALL_PORT=3080 ;;
+esac
+if [ -f "${UI_CONF}" ]; then
+    sed -i "s|\"port\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"port\": \"${INSTALL_PORT}\"|" "${UI_CONF}" 2>/dev/null || true
+    chmod 644 "${UI_CONF}" 2>/dev/null || true
+    echo "桌面入口端口已设为 ${INSTALL_PORT}"
+fi
+
+# ── 6. 目录权限 ──────────────────────────────────────────────────────────────
+# ── 6. 目录权限 ──────────────────────────────────────────────────────────────
+# 应用以包用户身份运行，需要写权限的只有 var 与 home。
+chmod 755 "${APP_VAR}" "${APP_HOME}" 2>/dev/null || true
+# 令牌文件只有属主可读写
+[ -f "${TOKEN_FILE}" ] && chmod 600 "${TOKEN_FILE}" 2>/dev/null || true
+
+# profile 的 node_modules 必须对包用户可读可执行，否则 DSH 加载插件失败。
+#
+# ★ 但这一行之后必须重新收紧凭据文件，原因：
+#   DSH 的 dsh-credentials-local 在启动时会校验 .credentials.yaml 的权限，
+#   一旦发现「属主以外的人也能读」，就直接拒绝启动并报：
+#     credentials-local: .credentials.yaml is readable beyond its owner (mode 755)
+#   chmod -R a+rX 会把它从 600 放宽到 644/755，于是出现
+#   「首次安装能用、停用后再启动变成 502 白屏」—— 这是真实踩到的坑。
+chmod -R a+rX "${APP_HOME}/profiles" 2>/dev/null || true
+find "${APP_HOME}" -name '.credentials.yaml' -type f -exec chmod 600 {} + 2>/dev/null || true
+
+# var 目录整体归属到运行用户，避免 root 安装后包用户无法写日志/pid。
+if [ "$(id -u)" = "0" ] && [ -n "${TRIM_USERNAME:-}" ]; then
+    chown -R "${TRIM_USERNAME}:${TRIM_USERNAME}" "${APP_VAR}" 2>/dev/null || true
+    chown -R "${TRIM_USERNAME}:${TRIM_USERNAME}" "${APP_HOME}" 2>/dev/null || true
+fi
+
+echo "DeepSeek Harness 安装完成"
+exit 0
