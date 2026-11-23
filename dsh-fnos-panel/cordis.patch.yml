@@ -1,0 +1,12 @@
+# dsh-fnos-panel —— 飞牛 fnOS 面板
+#
+# 同时注册 Host 与 Client 两个面：
+#   - Host（index.js）：读访问令牌与服务端口、中转登录回调、报告登录状态
+#   - Client（client.js）：在侧栏插入「跨设备访问」入口与弹窗
+#
+# 注意：这里用插件包名而不是绝对路径，因为包会被安装到
+# $DSH_HOME/profiles/<name>/node_modules/ 下，由该 profile 解析。
+- insert:
+    - id: dsh-fnos-panel
+      name: 'dsh-fnos-panel'
+      config: {}
