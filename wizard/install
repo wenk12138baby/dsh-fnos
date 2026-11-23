@@ -1,0 +1,27 @@
+[
+  {
+    "stepTitle": "基础设置",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "DeepSeek Harness 会在飞牛桌面窗口内直接打开，点开即用。\n\n本应用依赖 Node.js v24 运行时。如果还没安装，应用中心会自动提示并帮你装好，装完继续即可，不需要你手动去装。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_port",
+        "label": "服务端口",
+        "initValue": "3080",
+        "rules": [
+          { "required": true, "message": "请填写端口" },
+          { "pattern": "^[0-9]+$", "message": "端口只能是数字" }
+        ]
+      },
+      {
+        "type": "switch",
+        "field": "wizard_enforce_admin",
+        "label": "仅管理员可访问",
+        "initValue": "true"
+      }
+    ]
+  }
+]
