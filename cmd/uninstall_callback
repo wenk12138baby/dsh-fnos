@@ -1,0 +1,168 @@
+#!/bin/bash
+# ============================================================================
+#  uninstall_callback —— 应用文件清理后执行
+# ============================================================================
+#  目标：
+#    1. 卸载后不留任何会让「立刻重装」失败的状态。
+#    2. 真正服从卸载向导里「保留我的数据」这个开关。
+#
+#  恒清（与用户选择无关，属于运行期残留 / 无用缓存）：
+#    - app.sock / gateway.pid / internal.port / tmp/ / notice.py
+#
+#  用户数据（受 wizard_keep_data 控制）：
+#    - ${TRIM_PKGHOME}           会话、profile、登录态、插件
+#    - ${TRIM_PKGVAR}            日志、固定令牌
+#    - ${TRIM_PKGETC}            配置
+#    - ${TRIM_DATA_SHARE_PATHS}  共享目录（工作区），冒号分隔，可能多个
+#    - ${TRIM_PKGTMP}            临时目录
+#    - ${TRIM_PKGMETA}           元数据目录
+#
+#  变量名以官方文档为准：
+#    https://developer.fnnas.com/docs/core-concepts/environment-variables/
+#    （没有 TRIM_APPSHARE / TRIM_APPTEMP 这两个名字）
+#
+#  ★ 关于「勾了删除数据却没生效」的排查线索：
+#    本脚本会把收到的向导变量、每一步的删除结果写进
+#    /tmp/dsh-uninstall-<时间>.log（root 可读）。
+#    下次再遇到「没生效」，直接看这个文件就能判断是
+#      (a) 向导值不是 false（用户其实选了保留，或向导没弹）
+#      (b) 删除失败（权限/占用）
+#      (c) 脚本没被执行
+# ============================================================================
+
+set -u
+
+LOG="/tmp/dsh-uninstall-$(date +%Y%m%d-%H%M%S).log"
+: > "${LOG}" 2>/dev/null || LOG=/dev/null
+
+note() {
+    echo "$1" | tee -a "${LOG}" >&2
+}
+
+note "=== uninstall_callback 开始 $(date '+%F %T') ==="
+note "TRIM_APPDEST=${TRIM_APPDEST:-<未设置>}"
+note "TRIM_PKGHOME=${TRIM_PKGHOME:-<未设置>}"
+note "TRIM_PKGVAR=${TRIM_PKGVAR:-<未设置>}"
+note "TRIM_PKGETC=${TRIM_PKGETC:-<未设置>}"
+note "TRIM_PKGTMP=${TRIM_PKGTMP:-<未设置>}"
+note "TRIM_PKGMETA=${TRIM_PKGMETA:-<未设置>}"
+note "TRIM_DATA_SHARE_PATHS=${TRIM_DATA_SHARE_PATHS:-<未设置>}"
+note "wizard_keep_data=<${wizard_keep_data:-未传入}>"
+# 把收到的所有 wizard_* 变量都记下来，便于确认 fnOS 到底传了什么
+env | grep -E '^wizard_' | sed 's/^/  env: /' | while read -r line; do note "${line}"; done
+
+# ── 运行期残留：无论如何都清 ────────────────────────────────────────────────
+rm -f "${TRIM_APPDEST}/app.sock" 2>/dev/null || true
+
+if [ -n "${TRIM_PKGVAR:-}" ]; then
+    rm -f "${TRIM_PKGVAR}/gateway.pid" 2>/dev/null || true
+    rm -f "${TRIM_PKGVAR}/internal.port" 2>/dev/null || true
+    rm -f "${TRIM_PKGVAR}/notice.py" 2>/dev/null || true
+    rm -rf "${TRIM_PKGVAR}/tmp" 2>/dev/null || true
+fi
+
+# ── 用户数据：按向导选择决定 ────────────────────────────────────────────────
+#
+# 现在用 radio 字段 wizard_data_action，取值明确：keep / delete。
+#
+# 为什么从 switch 换成 radio（真实踩过的坑）：
+#   switch 只有「开/关」两态，关闭时 fnOS 可能传空字符串而不是 "false"。
+#   而 `${VAR:-true}` 会把空值当「未传」→ 落到默认「保留」，
+#   于是用户明明选了删除，数据却还在。用 radio 两态都有明确字面值，
+#   不存在「空值等于什么」的歧义。
+#
+# 兼容：旧版向导用的是 wizard_keep_data（true/false），仍然认。
+ACTION="${wizard_data_action:-}"
+
+if [ -z "${ACTION}" ]; then
+    # 兼容旧字段
+    case "${wizard_keep_data:-}" in
+        false|False|FALSE|0|no|off|No|Off|NO|OFF) ACTION="delete" ;;
+        true|True|TRUE|1|yes|on|Yes|On|YES|ON)   ACTION="keep" ;;
+        *) ACTION="keep" ;;   # 都没传：向导未出现，保守保留
+    esac
+    note "（旧字段回退）依据 wizard_keep_data 判定 ACTION=${ACTION}"
+fi
+
+note "解析结果: ACTION=${ACTION}"
+
+case "${ACTION}" in
+    delete)
+        note "按用户选择清理数据目录..."
+
+        # 只删本应用自己的目录，绝不碰别的应用。
+        # 两道路径校验：必须是应用私有目录，且尾部目录名等于本应用名。
+        APPNAME=$(basename "${TRIM_APPDEST:-/x/DeepSeekHarness}")
+
+        # 待删列表：固定目录 + 共享目录（TRIM_DATA_SHARE_PATHS 是冒号分隔，
+        # 可能含 `.../@appshare/<app>` 与 `.../@appshare/<app>/workspace` 两条，
+        # 统一折算到顶层的 `@appshare/<app>`，只删一次）。
+        TARGETS=""
+        for dir in \
+            "${TRIM_PKGHOME:-}" \
+            "${TRIM_PKGVAR:-}" \
+            "${TRIM_PKGETC:-}" \
+            "${TRIM_PKGTMP:-}" \
+            "${TRIM_PKGMETA:-}" ; do
+            [ -n "${dir}" ] && TARGETS="${TARGETS} ${dir}"
+        done
+        if [ -n "${TRIM_DATA_SHARE_PATHS:-}" ]; then
+            OLD_IFS="${IFS}"
+            IFS=':'
+            for sp in ${TRIM_DATA_SHARE_PATHS}; do
+                IFS="${OLD_IFS}"
+                # 折算：.../@appshare/<app>[/...]  →  .../@appshare/<app>
+                case "${sp}" in
+                    */@appshare/"${APPNAME}"/*)
+                        TARGETS="${TARGETS} $(printf '%s' "${sp}" | sed "s|\(.*/@appshare/${APPNAME}\).*|\1|")"
+                        ;;
+                    *)
+                        TARGETS="${TARGETS} ${sp}"
+                        ;;
+                esac
+            done
+            IFS="${OLD_IFS}"
+        fi
+
+        # 去重
+        TARGETS=$(printf '%s\n' ${TARGETS} | awk 'NF && !seen[$0]++')
+
+        for dir in ${TARGETS}; do
+            case "${dir}" in
+                */@apphome/*|*/@appdata/*|*/@appconf/*|*/@appshare/*|*/@apptemp/*|*/@appmeta/*) ;;
+                *)
+                    note "跳过可疑路径（不是应用私有目录）：${dir}"
+                    continue
+                    ;;
+            esac
+            case "${dir}" in
+                */"${APPNAME}") ;;
+                *)
+                    note "跳过可疑路径（应用名不匹配）：${dir}"
+                    continue
+                    ;;
+            esac
+
+            if [ -e "${dir}" ]; then
+                rm -rf "${dir}" 2>>"${LOG}"
+                if [ -e "${dir}" ]; then
+                    # 权限/占用导致删不掉时，尽力清空内容并记录
+                    find "${dir}" -mindepth 1 -delete 2>>"${LOG}" || true
+                fi
+                if [ -e "${dir}" ]; then
+                    note "❌ 删除失败（仍存在）：${dir}"
+                else
+                    note "✅ 已删除：${dir}"
+                fi
+            else
+                note "（不存在，跳过）：${dir}"
+            fi
+        done
+        ;;
+    *)
+        note "按用户选择保留数据目录（重新安装后可继续使用）"
+        ;;
+esac
+
+note "=== uninstall_callback 结束 ==="
+exit 0
