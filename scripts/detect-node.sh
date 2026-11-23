@@ -88,7 +88,11 @@ path_node=$(command -v node 2>/dev/null || true)
 candidates="${candidates} /usr/local/bin/node /usr/bin/node /opt/node/bin/node"
 
 # 5) 最后兜底：find 一次（限定深度，避免在 NAS 上扫全盘）
-found=$(find /var/apps /vol1/@appcenter /vol2/@appcenter /usr/local /opt \
+#    不写死 /vol1 /vol2 —— 用 /vol* 展开覆盖任意卷号（/vol1、/vol5、/vol10…）。
+#    之前写死 /vol1 和 /vol2 时，装在 /vol5 的 nodejs 应用探测不到，
+#    表现就是「明明装了 Node.js v24，应用仍报找不到运行时」。
+vol_roots=$(for v in /vol*/@appcenter; do [ -d "${v}" ] && printf '%s ' "${v}"; done)
+found=$(find /var/apps ${vol_roots} /usr/local /opt \
     -maxdepth 4 -type f -name node -perm -u+x 2>/dev/null | head -20)
 for f in ${found}; do
     candidates="${candidates} ${f}"
