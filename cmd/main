@@ -1,0 +1,840 @@
+#!/bin/bash
+# ============================================================================
+#  DeepSeek Harness — 飞牛 fnOS 生命周期主脚本  (v3)
+# ============================================================================
+#  fnOS 调用：main start | stop | status
+#    exit 0 = 成功 / 正在运行
+#    exit 3 = 未运行（仅 status）
+#    exit 1 = 失败
+#
+# ---------------------------------------------------------------------------
+#  本版本相对旧版的硬性改进（每一条都对应一次真实故障）：
+#
+#  1) 端口真正释放：stop 之后轮询确认「端口已无人监听」才返回成功，
+#     而不是发完 kill 就 exit 0。旧版因此让「停用→启用」必然失败。
+#  2) 杀整棵进程树：dsb 会 fork 出自己的子进程（bash 工具、subagent、
+#     sandbox runner）。只杀网关 = 留下一堆孤儿继续占端口。
+#     这里按「进程组 + 父子树」双向收敛，直到没有残留。
+#  3) 内部端口不再写死 ±10000：改成从空闲端口池里挑，彻底消除
+#     13080 被别的应用占用时、用户改端口也救不回来的死局。
+#  4) 卸载清理：pid 文件、socket、固定令牌、临时目录全部清掉，
+#     「卸载→立刻重装」不会因为残留状态误判。
+#  5) 绝不硬编码卷号：所有路径都来自 TRIM_* 或运行时探测，
+#     /vol1 /vol2 /vol5 任意卷都能装、能跑。
+# ============================================================================
+
+set -u
+
+# ── 路径解析 ────────────────────────────────────────────────────────────────
+# 正常由 fnOS 注入 TRIM_*；手动执行（排查/自检）时这些变量不存在，
+# set -u 会直接崩在 unbound variable，反而看不到真正的失败原因。
+SELF_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+APP_DEST="${TRIM_APPDEST:-}"
+if [ -z "${APP_DEST}" ]; then
+    # /var/apps/<app> 只是注册壳，真正内容在 target -> /vol*/@appcenter/<app>。
+    if [ -n "${SELF_DIR}" ] && [ -d "${SELF_DIR}/../target/gateway" ]; then
+        APP_DEST=$(cd "${SELF_DIR}/../target" && pwd)
+    elif [ -n "${SELF_DIR}" ] && [ -d "${SELF_DIR}/../gateway" ]; then
+        APP_DEST=$(cd "${SELF_DIR}/.." && pwd)
+    else
+        APP_DEST=/var/apps/DeepSeekHarness/target
+    fi
+fi
+export TRIM_APPDEST="${APP_DEST}"
+
+# fnOS 把 target/etc、var、home 做成软链；readlink -f 解析到真实存储路径。
+resolve_dir() {
+    local link="$1" fallback="$2"
+    if [ -d "${link}" ]; then
+        readlink -f "${link}" 2>/dev/null || echo "${fallback}"
+    else
+        echo "${fallback}"
+    fi
+}
+
+# ── 目录解析 ────────────────────────────────────────────────────────────────
+# 目标：home/var/etc 必须落到 <vol>/@apphome|@appdata|@appconf/<app>，
+# 不论应用装在哪个卷、不论 fnOS 是否注入了 TRIM_*。
+#
+# 踩过的坑：
+#   1. TRIM_APPDEST 的值是 @appcenter/<app>（已解开的真实路径）。它的上一级
+#      是 <vol>/@appcenter —— 整卷根，不是本应用。
+#   2. 卷根下面恰好也存在 var/etc/home 同名目录（历史遗留），所以「按目录
+#      是否存在」猜壳一定猜错。
+# 因此只用正向特征判定壳：/var/apps/<app>/home 是指向 @apphome 的软链。
+RESOLVE_SHELL_NAME=$(basename "${APP_DEST%/}")
+if [ -L "/var/apps/${RESOLVE_SHELL_NAME}/home" ]; then
+    APP_SHELL="/var/apps/${RESOLVE_SHELL_NAME}"
+else
+    APP_SHELL=$(cd "$(dirname "${APP_DEST%/}")" 2>/dev/null && pwd || echo "/var/apps/${RESOLVE_SHELL_NAME}")
+fi
+
+APP_HOME="${TRIM_PKGHOME:-$(resolve_dir "${APP_SHELL}/home" "${APP_SHELL}/home")}"
+APP_VAR="${TRIM_PKGVAR:-$(resolve_dir "${APP_SHELL}/var" "${APP_SHELL}/var")}"
+APP_ETC="${TRIM_PKGETC:-$(resolve_dir "${APP_SHELL}/etc" "${APP_SHELL}/etc")}"
+
+# 对外服务端口：向导值 > manifest.service_port > 3080
+SERVICE_PORT="${wizard_port:-${TRIM_SERVICE_PORT:-3080}}"
+case "${SERVICE_PORT}" in
+    ''|*[!0-9]*) SERVICE_PORT=3080 ;;
+esac
+
+# ── 读取用户配置 ────────────────────────────────────────────────────────────
+# config.conf 由 install_callback 生成，含 ENFORCE_ADMIN / GATEWAY_PREFIX。
+# 之前这个文件生成了却没人读，向导里的「仅管理员可访问」开关等于摆设。
+CONF_FILE="${APP_ETC}/config.conf"
+if [ -f "${CONF_FILE}" ]; then
+    # shellcheck disable=SC1090
+    . "${CONF_FILE}" 2>/dev/null || true
+fi
+export ENFORCE_ADMIN="${ENFORCE_ADMIN:-1}"
+export GATEWAY_PREFIX="${GATEWAY_PREFIX:-/app/DeepSeekHarness}"
+
+GATEWAY="${APP_DEST}/gateway/server.mjs"
+PID_FILE="${APP_VAR}/gateway.pid"
+PORT_FILE="${APP_VAR}/internal.port"
+LOG_FILE="${APP_VAR}/gateway.log"
+
+# ── 内部端口：从空闲端口池里挑，不再写死 ±10000 ──────────────────────────
+# 旧版内部端口 = SERVICE_PORT ± 10000，13080 被别的应用占用时无解。
+# 现在由 start 探测空闲端口并写入 PORT_FILE；stop/status 读它。
+pick_internal_port() {
+    local candidate
+    for candidate in $(seq 13900 13999) $(seq 23900 23999) $(seq 39000 39099); do
+        [ "${candidate}" = "${SERVICE_PORT}" ] && continue
+        if ! port_in_use "${candidate}"; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 读出上次启动记录的内部端口（用于 stop 时反查子进程）。
+read_internal_port() {
+    [ -f "${PORT_FILE}" ] || return 1
+    local p
+    p=$(head -n1 "${PORT_FILE}" 2>/dev/null | tr -d '[:space:]')
+    case "${p}" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    echo "${p}"
+}
+
+# ── Node 运行时探测 ────────────────────────────────────────────────────────
+# 用 bash 显式解释执行，不依赖可执行位（fpk 内脚本权限是 644）。
+NODE_BIN=$(bash "${APP_DEST}/scripts/detect-node.sh" 2>/dev/null || true)
+
+# ── PATH：插件管理器要 pnpm，pnpm 转发要 npm，两者都要 node ────────────────
+if [ -n "${NODE_BIN}" ] && [ -x "${NODE_BIN}" ]; then
+    NODE_DIR=$(dirname "${NODE_BIN}")
+    export PATH="${APP_DEST}/.local/bin:${NODE_DIR}:${PATH}"
+else
+    export PATH="${APP_DEST}/.local/bin:${PATH}"
+fi
+
+append_path_dir() {
+    local dir="$1"
+    [ -d "${dir}" ] || return 0
+    case ":${PATH}:" in
+        *":${dir}:"*) return 0 ;;
+    esac
+    PATH="${PATH}:${dir}"
+}
+# 系统级 node bin 兜底：不写死某个卷，用 glob 覆盖所有卷上的 nodejs 应用。
+for _d in /var/apps/nodejs*/target/bin /var/apps/nodejs*/bin /vol*/@appcenter/nodejs*/target/bin /vol*/@appcenter/nodejs*/bin; do
+    append_path_dir "${_d}"
+done
+unset _d
+append_path_dir /usr/local/bin
+append_path_dir /usr/bin
+export PATH
+
+# 包内 shim 可执行位兜底修复（构建机写出的文件可能是 0666）。
+if [ -d "${APP_DEST}/.local/bin" ]; then
+    for _shim in "${APP_DEST}/.local/bin/pnpm" "${APP_DEST}/.local/bin/npm"; do
+        if [ -f "${_shim}" ] && [ ! -x "${_shim}" ]; then
+            chmod 755 "${_shim}" 2>/dev/null || true
+        fi
+    done
+    unset _shim
+fi
+
+# 反代与 DSH 都以包用户身份运行，root 生命周期脚本需要降权。
+# PATH 必须显式传：runuser 实现不同，有的会重置环境，丢了 PATH 插件管理器就 ENOENT。
+run_as_app() {
+    if [ "$(id -u)" = "0" ] && [ -n "${TRIM_USERNAME:-}" ]; then
+        runuser -u "${TRIM_USERNAME}" -- env "PATH=${PATH}" "$@"
+    elif [ "$(id -u)" = "0" ] && id -u "${RESOLVE_SHELL_NAME}" >/dev/null 2>&1; then
+        runuser -u "${RESOLVE_SHELL_NAME}" -- env "PATH=${PATH}" "$@"
+    else
+        "$@"
+    fi
+}
+
+# 判断进程是否还活着。读 /proc 比 kill -0 可靠（能区分僵尸）。
+is_alive() {
+    local pid="$1"
+    [ -n "${pid}" ] || return 1
+    [ -d "/proc/${pid}" ] || return 1
+    local state
+    state=$(awk '{print $3}' "/proc/${pid}/stat" 2>/dev/null)
+    [ "${state}" != "Z" ]
+}
+
+# ── 可靠地找出网关 PID ────────────────────────────────────────────────────
+# 不能只信 PID_FILE：start 用 `runuser setsid nohup node` 拉起网关，
+# $! 拿到的是 runuser/setsid 的 PID，setsid 又会 fork，对不上真正监听端口的 node。
+# 所以真正可信的是「谁在监听 SERVICE_PORT」。
+listener_pid() {
+    local port="$1"
+    command -v ss >/dev/null 2>&1 || return 1
+    ss -ltnpH "sport = :${port}" 2>/dev/null \
+        | grep -o 'pid=[0-9]\+' | head -1 | cut -d= -f2
+}
+
+# 读某个进程的 cmdline（NUL 分隔转空格）。
+#
+# 注意：`tr ... < /proc/<pid>/cmdline 2>/dev/null` 这种写法**吞不掉报错** ——
+# `2>/dev/null` 只重定向 tr 的 stderr，读取失败是 shell 自己做重定向时报的。
+# 进程在扫描过程中退出时就会刷出
+#     main: line 214: /proc/12345/cmdline: No such file or directory
+# 这类噪音，看起来像脚本出错了。改用 cat 把读文件这一步隔开，错误才被吞掉。
+read_cmdline() {
+    local pid="$1"
+    cat "/proc/${pid}/cmdline" 2>/dev/null | tr '\0' ' '
+}
+
+# 扫 /proc 找命令行里带指定路径串的进程（不依赖 ss 权限）。
+proc_pid_by_cmdline() {
+    local needle="$1" pid line
+    for pid in /proc/[0-9]*; do
+        pid=${pid#/proc/}
+        [ "$pid" = "$$" ] && continue
+        line=$(read_cmdline "${pid}")
+        [ -n "${line}" ] || continue
+        case "${line}" in
+            *"${needle}"*) echo "${pid}"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# 扫 /proc 找所有命令行里带指定路径串的进程（全部）。
+proc_pids_by_cmdline() {
+    local needle="$1" pid line
+    for pid in /proc/[0-9]*; do
+        pid=${pid#/proc/}
+        [ "$pid" = "$$" ] && continue
+        line=$(read_cmdline "${pid}")
+        [ -n "${line}" ] || continue
+        case "${line}" in
+            *"${needle}"*) echo "${pid}" ;;
+        esac
+    done
+    return 0
+}
+
+gateway_pid() {
+    local pid
+    pid=$(listener_pid "${SERVICE_PORT}")
+    if [ -n "${pid}" ] && is_alive "${pid}"; then
+        echo "${pid}"
+        return 0
+    fi
+    pid=$(proc_pid_by_cmdline "${GATEWAY}")
+    if [ -n "${pid}" ] && is_alive "${pid}"; then
+        echo "${pid}"
+        return 0
+    fi
+    return 1
+}
+
+# dsh 主进程：监听内部端口的那个，或命令行含 dsh/lib/bin.js 的。
+dsh_child_pids() {
+    local ip port_based
+    ip=$(read_internal_port || true)
+    if [ -n "${ip}" ]; then
+        port_based=$(listener_pid "${ip}")
+        if [ -n "${port_based}" ] && is_alive "${port_based}"; then
+            echo "${port_based}"
+        fi
+    fi
+    proc_pids_by_cmdline "dsh/node_modules/@deepseek-ai/dsh/lib/bin.js"
+}
+
+read_pid() {
+    [ -f "${PID_FILE}" ] || return 1
+    local pid line
+    pid=$(head -n1 "${PID_FILE}" 2>/dev/null | tr -d '[:space:]')
+    is_alive "${pid}" || return 1
+    line=$(read_cmdline "${pid}")
+    case "${line}" in
+        *"${GATEWAY}"*) ;;
+        *) return 1 ;;
+    esac
+    echo "${pid}"
+}
+
+# ── 进程树遍历：收集某个 PID 的全部子孙 ───────────────────────────────────
+# DSH 会 fork bash 工具、subagent、sandbox runner；只杀父进程会留下孤儿。
+#
+# 旧实现每调一次就完整扫一遍 /proc 并 fork 一个 awk —— 一次 kill 里要调用
+# 十几次，NAS 上进程一多就慢到几十秒，表现为「停用要转很久」甚至超时。
+# 现在全进程表只构建一次，后续遍历都在内存里做。
+# 一次 `ps` 拿到全表，比逐个读 /proc 快两个数量级。
+declare -A PPID_OF=()
+declare -A CHILDREN_OF=()
+
+snapshot_process_table() {
+    PPID_OF=()
+    CHILDREN_OF=()
+    local pid ppid
+    while read -r pid ppid; do
+        [ -n "${pid}" ] || continue
+        [ -n "${ppid}" ] || continue
+        PPID_OF[${pid}]=${ppid}
+        CHILDREN_OF[${ppid}]="${CHILDREN_OF[${ppid}]:-} ${pid}"
+    done < <(ps -e -o pid=,ppid= 2>/dev/null)
+}
+
+# 广度优先收集某个 PID 的全部子孙。依赖 snapshot_process_table 建好的表。
+descendants() {
+    local root="$1"
+    local queue=" ${root} "
+    local out=" "
+    local cur c
+    while [ -n "${queue// /}" ]; do
+        cur=${queue%% *}
+        queue=${queue#* }
+        queue=${queue# }
+        [ -n "${cur}" ] || continue
+        for c in ${CHILDREN_OF[${cur}]:-}; do
+            out="${out}${c} "
+            queue="${queue}${c} "
+        done
+    done
+    echo "${out}"
+}
+
+# 进程组 ID
+pgid_of() {
+    local pid="$1"
+    ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' '
+}
+
+# ── 彻底清理本应用的所有进程 ──────────────────────────────────────────────
+kill_our_processes() {
+    local sig="${1:-TERM}" round=0 pids=""
+
+    # 先把进程表快照一次，后面所有 descendants 都走内存，不再逐次扫 /proc。
+    snapshot_process_table
+
+    # 收集：网关、它的子孙、dsh 主进程及其子孙、PID 文件里的、监听端口的。
+    local gw
+    gw=$(gateway_pid || true)
+    if [ -n "${gw}" ]; then
+        pids="${pids} ${gw} $(descendants "${gw}")"
+    fi
+    for p in $(dsh_child_pids); do
+        pids="${pids} ${p} $(descendants "${p}")"
+    done
+    for p in $(proc_pids_by_cmdline "${GATEWAY}"); do
+        pids="${pids} ${p} $(descendants "${p}")"
+    done
+    # 缺 Node 时占住端口的降级说明页（python3 notice.py）。
+    # 漏掉它正是「停用应用后 3080 仍被占用」的直接原因之一。
+    for p in $(proc_pids_by_cmdline "${APP_VAR}/notice.py"); do
+        pids="${pids} ${p} $(descendants "${p}")"
+    done
+    # 兜底：谁在监听对外端口就一并收掉（能抓到被 runuser/setsid 包了多层的进程）。
+    local lp
+    lp=$(listener_pid "${SERVICE_PORT}" || true)
+    if [ -n "${lp}" ] && is_alive "${lp}"; then
+        pids="${pids} ${lp} $(descendants "${lp}")"
+    fi
+    if [ -f "${PID_FILE}" ]; then
+        local fp
+        fp=$(head -n1 "${PID_FILE}" 2>/dev/null | tr -d '[:space:]')
+        is_alive "${fp}" && pids="${pids} ${fp}"
+    fi
+
+    local uniq
+    uniq=$(echo ${pids} | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')
+    [ -z "${uniq// /}" ] && return 0
+
+    # 先按进程组杀（setsid 启动时 PGID == 首进程 PID），再逐个补刀。
+    local pgids=""
+    for pid in ${uniq}; do
+        is_alive "${pid}" || continue
+        local pg
+        pg=$(pgid_of "${pid}")
+        [ -n "${pg}" ] && pgids="${pgids} ${pg}"
+    done
+    for pg in $(echo ${pgids} | tr ' ' '\n' | sort -un); do
+        [ "${pg}" -gt 1 ] 2>/dev/null && kill -"${sig}" -- "-${pg}" 2>/dev/null || true
+    done
+    for pid in ${uniq}; do
+        is_alive "${pid}" && kill -"${sig}" "${pid}" 2>/dev/null || true
+    done
+
+    # 等它们真的退出（最多 10 秒）
+    local i=0
+    while [ "${i}" -lt 20 ]; do
+        local alive_any=""
+        for pid in ${uniq}; do
+            is_alive "${pid}" && alive_any="1" && break
+        done
+        [ -z "${alive_any}" ] && break
+        sleep 0.5
+        i=$((i + 1))
+    done
+
+    if [ "${sig}" = "TERM" ]; then
+        for pid in ${uniq}; do
+            is_alive "${pid}" && kill -KILL "${pid}" 2>/dev/null || true
+        done
+        # 第二轮：处理刚被收养进 init 的孙进程
+        for p in $(proc_pids_by_cmdline "${GATEWAY}") $(dsh_child_pids); do
+            is_alive "${p}" && kill -KILL "${p}" 2>/dev/null || true
+        done
+    fi
+    return 0
+}
+
+port_in_use() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltnH "sport = :${port}" 2>/dev/null | grep -q .
+        return $?
+    fi
+    return 1
+}
+
+# 轮询确认端口真的空了 —— stop 成功与否的唯一判据。
+wait_port_free() {
+    local port="$1" timeout="${2:-20}" i=0
+    while [ "${i}" -lt $((timeout * 2)) ]; do
+        port_in_use "${port}" || return 0
+        sleep 0.5
+        i=$((i + 1))
+    done
+    return 1
+}
+
+fail() {
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "$1" >> "${TRIM_TEMP_LOGFILE}"
+    fi
+    echo "DeepSeek Harness: $1" >&2
+    exit 1
+}
+
+# ── fnOS 插件自愈 ───────────────────────────────────────────────────────────
+# dsh-fnos-plugin 提供 fnos_system_info / fnos_list_apps / fnos_storage
+# 三个工具，让模型知道自己在 NAS 上。它有两个脆弱点：
+#
+#   1. 安装在 dsh/node_modules/ 里，但不在 dsh 的依赖树中（npm ls 显示
+#      extraneous）。一次 `npm prune` 就会把它物理删除。
+#   2. 通过 $DSH_HOME/cordis.patch.yml 的绝对路径挂载。插件市场装卸任何
+#      插件都可能重算 bundles，把这行 patch 冲掉。
+#
+# 两种情况后果相同：三个工具**静默消失**，没有任何报错，用户只会觉得
+# 「它变笨了」。所以每次启动前自检并修复。
+ensure_fnos_plugin() {
+    local plugin_src="${APP_DEST}/dsh/node_modules/dsh-fnos-plugin"
+    local backup_dir="${APP_VAR}/plugin-backup/dsh-fnos-plugin"
+    local patch_file="${APP_HOME}/cordis.patch.yml"
+
+    # ① 插件本体：缺了就从备份恢复
+    if [ ! -f "${plugin_src}/index.js" ]; then
+        if [ -d "${backup_dir}" ]; then
+            mkdir -p "$(dirname "${plugin_src}")" 2>/dev/null || true
+            cp -r "${backup_dir}" "${plugin_src}" 2>/dev/null || true
+            echo "fnos 插件缺失，已从备份恢复：${plugin_src}" >> "${LOG_FILE}" 2>&1 || true
+        else
+            echo "fnos 插件缺失且无备份，fnos_* 工具将不可用" >> "${LOG_FILE}" 2>&1 || true
+            return 0
+        fi
+    fi
+
+    # ② home patch：缺 fnos-integration 就补回去
+    if [ -f "${patch_file}" ]; then
+        if ! grep -q "fnos-integration" "${patch_file}" 2>/dev/null; then
+            cat >> "${patch_file}" <<PATCHEOF
+
+- insert:
+    - id: fnos-integration
+      name: file://${plugin_src}/index.js
+      config:
+        promptSection: true
+        tools: true
+        appsDir: /var/apps
+PATCHEOF
+            chmod 644 "${patch_file}" 2>/dev/null || true
+            echo "cordis.patch.yml 缺少 fnos-integration，已补回" >> "${LOG_FILE}" 2>&1 || true
+        fi
+    fi
+
+    # ③ 备份不存在时补一份，供 ① 使用
+    if [ ! -d "${backup_dir}" ] && [ -d "${plugin_src}" ]; then
+        mkdir -p "$(dirname "${backup_dir}")" 2>/dev/null || true
+        cp -r "${plugin_src}" "${backup_dir}" 2>/dev/null || true
+    fi
+    return 0
+}
+
+case "${1:-}" in
+
+start)
+    if pid=$(read_pid); then
+        echo "DeepSeek Harness 已在运行（PID ${pid}）"
+        exit 0
+    fi
+
+    [ -f "${GATEWAY}" ] || fail "网关脚本缺失：${GATEWAY}"
+
+    # ── 先清自己的残留，再判断端口归属 ────────────────────────────────────
+    if [ -n "$(gateway_pid || true)" ] || [ -n "$(dsh_child_pids || true)" ]; then
+        echo "检测到本应用残留进程，先清理再启动"
+        kill_our_processes TERM
+        rm -f "${TRIM_APPDEST}/app.sock" "${PID_FILE}" 2>/dev/null || true
+    fi
+
+    # 对外端口：清理后仍被占 = 真的是别的程序
+    if port_in_use "${SERVICE_PORT}"; then
+        fail "端口 ${SERVICE_PORT} 已被其他程序占用，请在应用设置中更换端口。"
+    fi
+
+    mkdir -p "${APP_VAR}" "${APP_HOME}" "${APP_ETC}"
+    chmod 755 "${APP_VAR}" "${APP_HOME}" 2>/dev/null || true
+
+    export TMPDIR="${APP_VAR}/tmp"
+    mkdir -p "${TMPDIR}"
+
+    cd "${APP_DEST}" || fail "无法进入应用目录"
+
+    # ── 缺 Node 时的降级说明页 ─────────────────────────────────────────────
+    if [ -z "${NODE_BIN}" ] || [ ! -x "${NODE_BIN}" ]; then
+        if command -v python3 >/dev/null 2>&1; then
+            if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+                echo "未找到可用的 Node.js 运行时（需 24.2+）。请先在应用中心安装 Node.js v24。" >> "${TRIM_TEMP_LOGFILE}"
+            fi
+            cat > "${APP_VAR}/notice.py" <<'NOTICE'
+import http.server, socketserver, sys
+PAGE = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>DeepSeek Harness</title><style>
+body{font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+display:flex;align-items:center;justify-content:center;height:100vh;margin:0;
+background:#fafafa;color:#1f2328}
+.box{max-width:560px;padding:32px;background:#fff;border-radius:12px;
+box-shadow:0 2px 12px rgba(0,0,0,.08)}
+h1{font-size:18px;margin:0 0 12px}
+p{line-height:1.7;margin:8px 0;font-size:14px}
+.tip{margin-top:16px;padding:12px;background:#fff8e6;border-left:3px solid #f0a020;
+border-radius:4px;font-size:13px;line-height:1.6}
+</style></head><body><div class="box">
+<h1>需要先安装 Node.js v24</h1>
+<p>DeepSeek Harness 已安装，但没有找到可用的 Node.js 运行时（需要 24.2 或更高版本），服务无法启动。</p>
+<p><strong>解决方法：</strong>打开飞牛「应用中心」，安装 <strong>Node.js v24</strong>，
+然后回到应用中心停止并重新启动本应用即可。</p>
+<div class="tip">装好 Node.js v24 后无需其它操作，本应用会自动检测到它。</div>
+</div></body></html>"""
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = PAGE.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+class S(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+S(("0.0.0.0", int(sys.argv[1])), H).serve_forever()
+NOTICE
+            if command -v setsid >/dev/null 2>&1; then
+                run_as_app setsid nohup python3 "${APP_VAR}/notice.py" "${SERVICE_PORT}" \
+                    < /dev/null >> "${LOG_FILE}" 2>&1 &
+            else
+                run_as_app nohup python3 "${APP_VAR}/notice.py" "${SERVICE_PORT}" \
+                    < /dev/null >> "${LOG_FILE}" 2>&1 &
+            fi
+            notice_pid=""
+            nw=0
+            while [ "${nw}" -lt 20 ]; do
+                notice_pid=$(listener_pid "${SERVICE_PORT}")
+                if [ -n "${notice_pid}" ] && is_alive "${notice_pid}"; then break; fi
+                sleep 1
+                nw=$((nw + 1))
+            done
+            if [ -n "${notice_pid}" ] && is_alive "${notice_pid}"; then
+                echo "${notice_pid}" > "${PID_FILE}"
+                echo "说明页已启动（PID ${notice_pid}，端口 ${SERVICE_PORT}）"
+                exit 0
+            fi
+            fail "说明页未能启动，请检查 ${LOG_FILE}"
+        fi
+        fail "未找到可用的 Node.js 运行时（需 24.2+）。请先在应用中心安装 Node.js v24。"
+    fi
+
+    # ── 挑一个空闲的内部端口 ──────────────────────────────────────────────
+    INTERNAL_PORT=$(pick_internal_port || true)
+    if [ -z "${INTERNAL_PORT}" ]; then
+        fail "找不到可用的内部端口（13900-13999 / 23900-23999 / 39000-39099 都被占用）。"
+    fi
+    echo "${INTERNAL_PORT}" > "${PORT_FILE}"
+
+    export DSH_NODE_BIN="${NODE_BIN}"
+    export DSH_HOME="${APP_HOME}"
+    export DSH_PKGVAR="${APP_VAR}"
+    export DSH_PKGETC="${APP_ETC}"
+    # 显式告诉网关用哪个内部端口，避免网关自己再算一遍（旧版 ±10000 的隐患）。
+    export DSH_INTERNAL_PORT="${INTERNAL_PORT}"
+    export DSH_SERVICE_PORT="${SERVICE_PORT}"
+
+    # fnOS 插件自检与自愈：在拉起服务之前修好，避免三个 fnos_* 工具静默消失。
+    ensure_fnos_plugin
+
+    # fnOS 面板插件的 bundles 注册自愈。
+    #
+    # 全新安装时 profiles/<name>/package.json 由 dsh 首次启动才创建，
+    # 安装阶段的注册会被跳过（时序坑，见 install_callback 注释）。
+    # 这里每次启动前补注册：插件文件存在但不在 bundles 里就加上。
+    ensure_panel_registered() {
+        local pkg
+        for prof in web headless tui; do
+            local prof_dir="${APP_HOME}/profiles/${prof}"
+            [ -d "${prof_dir}/node_modules/dsh-fnos-panel" ] || continue
+            local pkgjson="${prof_dir}/package.json"
+            [ -f "${pkgjson}" ] || continue
+            command -v python3 >/dev/null 2>&1 || continue
+            pkg=$(python3 - "$pkgjson" "$prof" <<'PYEOF' 2>/dev/null
+import json, sys
+p, prof = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(p, encoding='utf-8'))
+    b = d.get('dsh', {}).get('profile', {}).get('bundles', [])
+except Exception:
+    print('no'); sys.exit(0)
+ok = 'dsh-fnos-panel' in b
+# 同时检查基础 bundle 是否齐全：缺了它们 dsh 起不来（曾导致 3080 无监听）
+if prof == 'web':
+    ok = ok and '@deepseek-ai/dsh-base' in b and '@deepseek-ai/dsh-web-app' in b
+elif prof == 'headless':
+    ok = ok and '@deepseek-ai/dsh-base' in b
+print('yes' if ok else 'no')
+PYEOF
+)
+            if [ "${pkg}" = "no" ]; then
+                python3 - "$pkgjson" "$prof" <<'PYEOF' 2>/dev/null || true
+import json, sys
+p, prof = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(p, encoding='utf-8'))
+    b = d.setdefault('dsh', {}).setdefault('profile', {}).setdefault('bundles', [])
+    # 安全兜底：dsh 的服务（webServer / credentials / systemPrompt / tools）
+    # 全部由基础 bundle 提供。若 bundles 里一个基础包都没有（例如被残缺配置
+    # 覆盖过），只 append 插件会让所有插件 pending、dsh 直接退出，
+    # 表现为「启动失败：端口 3080 无监听」。所以先把基础包补回去。
+    if prof == 'web':
+        for base in ('@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'):
+            if base not in b:
+                b.insert(0, base)
+    elif prof == 'headless':
+        if '@deepseek-ai/dsh-base' not in b:
+            b.insert(0, '@deepseek-ai/dsh-base')
+        if '@deepseek-ai/dsh-headless' not in b:
+            b.insert(1, '@deepseek-ai/dsh-headless')
+    if 'dsh-fnos-panel' not in b:
+        b.append('dsh-fnos-panel')
+    json.dump(d, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+except Exception:
+    pass
+PYEOF
+                echo "已修复并补注册 ${prof} profile 的 bundles" >> "${LOG_FILE}" 2>&1 || true
+            fi
+        done
+        return 0
+    }
+    ensure_panel_registered
+
+    # 第三方插件的 peer 依赖自愈。
+    #
+    # profile 的 .npmrc 设了 autoInstallPeers: false，插件声明的 peer 依赖
+    # （@earendil-works/pi-ai 等）不会自动装进 profile 的 node_modules，
+    # 于是插件加载时报 Cannot find package，页面全部报错。
+    # 这里每次启动前把宿主已有的这些包软链过去，已存在则跳过（幂等）。
+    ensure_plugin_peers() {
+        local host_nm="${APP_DEST}/dsh/node_modules"
+        local prof prof_nm pkg
+        for prof in web headless tui; do
+            prof_nm="${APP_HOME}/profiles/${prof}/node_modules"
+            [ -d "${prof_nm}" ] || continue
+
+            # ① 先按固定清单补（覆盖 dsh 自带的常用包）
+            for pkg in \
+                "@earendil-works/pi-ai" "@earendil-works/pi-schema" "@earendil-works/pi-telemetry" \
+                "@deepseek-ai/cordis" "@deepseek-ai/dsh-llm" "@deepseek-ai/dsh-llm-pi-ai" \
+                "@deepseek-ai/dsh-home-paths" "@deepseek-ai/dsh-settings" \
+                "@deepseek-ai/dsh-atomic-write" "@deepseek-ai/dsh-attachment" \
+                "@deepseek-ai/dsh-host-webserver" \
+                "@deepseek-ai/dsh-client-ui-primitives" "@deepseek-ai/dsh-client-ui-renderer" \
+                "@deepseek-ai/dsh-client-ui-settings" \
+                "react"; do
+                [ -d "${host_nm}/${pkg}" ] || continue
+                [ -e "${prof_nm}/${pkg}" ] && continue
+                mkdir -p "$(dirname "${prof_nm}/${pkg}")" 2>/dev/null || continue
+                ln -s "${host_nm}/${pkg}" "${prof_nm}/${pkg}" 2>/dev/null || true
+            done
+
+            # ② 再扫一遍已装第三方插件声明的 peerDependencies，动态补齐。
+            #    这样用户以后从插件市场装任何新插件，重启后依赖都会自动就位，
+            #    不用等我们预先把包名写进清单。
+            local pj dep
+            for pj in "${prof_nm}"/*/package.json "${prof_nm}"/@*/*/package.json; do
+                [ -f "${pj}" ] || continue
+                # 用 node 读取 peerDependencies 的键（dsh 自带 node，必定可用）
+                dep=$(NODE_PATH= "${NODE_BIN}" -e \
+                    'try{const p=require(process.argv[1]);console.log(Object.keys(p.peerDependencies||{}).join(" "))}catch(e){}' \
+                    "${pj}" 2>/dev/null || true)
+                [ -n "${dep}" ] || continue
+                for pkg in ${dep}; do
+                    [ -d "${host_nm}/${pkg}" ] || continue
+                    [ -e "${prof_nm}/${pkg}" ] && continue
+                    mkdir -p "$(dirname "${prof_nm}/${pkg}")" 2>/dev/null || continue
+                    ln -s "${host_nm}/${pkg}" "${prof_nm}/${pkg}" 2>/dev/null || true
+                done
+            done
+        done
+        return 0
+    }
+    ensure_plugin_peers
+
+    # 凭据文件权限自愈。
+    #
+    # DSH 的 dsh-credentials-local 启动时要求 .credentials.yaml **只有属主可读**，
+    # 否则直接拒绝启动：
+    #   credentials-local: .credentials.yaml is readable beyond its owner (mode 755)
+    # 表现为「首次安装能用，停用后再启动 → 502 白屏」。
+    #
+    # 成因可能是安装脚本的 a+rX、用户手改、或旧版本遗留。
+    # 这里每次启动前收紧一次，让已经坏掉的机器自己恢复，不用用户去跑 chmod。
+    if [ -d "${APP_HOME}" ]; then
+        find "${APP_HOME}" -name '.credentials.yaml' -type f -exec chmod 600 {} + 2>/dev/null || true
+    fi
+
+    # 插件工具链自检（不阻断启动，只写日志）。
+    {
+        echo "--- plugin toolchain check ---"
+        if command -v pnpm >/dev/null 2>&1; then
+            echo "pnpm: $(command -v pnpm) -> $(pnpm --version 2>/dev/null || echo 'version probe failed')"
+        else
+            echo "pnpm: MISSING (bundled .local/bin/pnpm not found or not executable)"
+        fi
+        if command -v npm >/dev/null 2>&1; then
+            echo "npm:  $(command -v npm) -> $(npm --version 2>/dev/null || echo 'version probe failed')"
+        else
+            echo "npm:  MISSING (pnpm 转发 npm 会失败)"
+        fi
+        echo "node: ${NODE_BIN:-未探测到}"
+        echo "internal_port: ${INTERNAL_PORT}"
+    } >> "${LOG_FILE}" 2>&1 || true
+
+    if command -v setsid >/dev/null 2>&1; then
+        run_as_app setsid nohup "${NODE_BIN}" "${GATEWAY}" \
+            < /dev/null >> "${LOG_FILE}" 2>&1 &
+    else
+        run_as_app nohup "${NODE_BIN}" "${GATEWAY}" \
+            < /dev/null >> "${LOG_FILE}" 2>&1 &
+    fi
+
+    # 不要用 `echo $!` 记 PID，改为轮询「谁在监听 SERVICE_PORT」。
+    started_pid=""
+    waited=0
+    while [ "${waited}" -lt 120 ]; do
+        started_pid=$(gateway_pid || true)
+        if [ -n "${started_pid}" ] && is_alive "${started_pid}"; then break; fi
+        if [ "${waited}" -gt 8 ] && ! is_alive "${started_pid:-0}"; then
+            # 进程已死而端口还没起来 = 启动失败，提前退出，别干等 120 秒
+            if ! proc_pid_by_cmdline "${GATEWAY}" >/dev/null 2>&1; then
+                break
+            fi
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if [ -n "${started_pid}" ] && is_alive "${started_pid}"; then
+        echo "${started_pid}" > "${PID_FILE}"
+        echo "DeepSeek Harness 启动成功（PID ${started_pid}，端口 ${SERVICE_PORT}，内部 ${INTERNAL_PORT}）"
+        exit 0
+    fi
+
+    {
+        echo "DeepSeek Harness 启动失败：等待 ${waited}s 后端口 ${SERVICE_PORT} 仍无监听。"
+        echo "--- 最近日志 ---"
+        tail -n 40 "${LOG_FILE}" 2>/dev/null || echo "(无法读取 ${LOG_FILE})"
+    } >&2
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "启动失败：端口 ${SERVICE_PORT} 无监听，详见 ${LOG_FILE}" >> "${TRIM_TEMP_LOGFILE}"
+    fi
+    kill_our_processes TERM >/dev/null 2>&1 || true
+    rm -f "${PID_FILE}" "${PORT_FILE}" 2>/dev/null || true
+    exit 1
+    ;;
+
+stop)
+    # 以实际进程为准做彻底清理，并**确认端口真的空出来**才返回成功。
+    local_any=""
+    for p in $(gateway_pid || true) $(dsh_child_pids || true) $(read_pid || true); do
+        [ -n "${p}" ] && local_any="1"
+    done
+
+    kill_our_processes TERM
+
+    # 补一轮：把可能刚变成孤儿的孙进程再收一次
+    sleep 0.5
+    kill_our_processes TERM
+
+    rm -f "${TRIM_APPDEST}/app.sock" "${PID_FILE}" 2>/dev/null || true
+
+    # ★ 关键：轮询确认端口真空了，否则返回失败并明确告知是谁占着。
+    if ! wait_port_free "${SERVICE_PORT}" 20; then
+        holder=$(listener_pid "${SERVICE_PORT}" || true)
+        rm -f "${PID_FILE}" 2>/dev/null || true
+        fail "端口 ${SERVICE_PORT} 在停止后仍被占用（持有者 PID ${holder:-未知}），请检查该进程。"
+    fi
+
+    ip=$(read_internal_port || true)
+    if [ -n "${ip}" ] && ! wait_port_free "${ip}" 10; then
+        echo "提示：内部端口 ${ip} 仍在占用，但对外端口已释放。" >&2
+    fi
+    rm -f "${PORT_FILE}" 2>/dev/null || true
+
+    if [ -z "${local_any}" ]; then
+        echo "DeepSeek Harness 未在运行"
+    else
+        echo "DeepSeek Harness 已停止（端口 ${SERVICE_PORT} 已释放）"
+    fi
+    exit 0
+    ;;
+
+status)
+    # 状态的唯一可信依据是「网关还在不在监听」。
+    pid=$(gateway_pid || true)
+    if [ -n "${pid}" ] && is_alive "${pid}"; then
+        echo "${pid}" > "${PID_FILE}" 2>/dev/null || true
+        exit 0
+    fi
+    rm -f "${PID_FILE}" 2>/dev/null || true
+    exit 3
+    ;;
+
+*)
+    echo "用法: $0 {start|stop|status}" >&2
+    exit 1
+    ;;
+esac
