@@ -1,0 +1,27 @@
+#!/bin/bash
+# ============================================================================
+#  config_init —— 应用设置变更前执行
+# ============================================================================
+#  校验向导提交的值，不合法时以清晰文案拒绝。
+# ============================================================================
+
+set -u
+
+if [ -n "${wizard_port:-}" ]; then
+    case "${wizard_port}" in
+        ''|*[!0-9]*)
+            if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+                echo "端口必须是数字，当前值：${wizard_port}" >> "${TRIM_TEMP_LOGFILE}"
+            fi
+            exit 1
+            ;;
+    esac
+    if [ "${wizard_port}" -lt 1024 ] || [ "${wizard_port}" -gt 65535 ]; then
+        if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+            echo "端口需在 1024-65535 之间，当前值：${wizard_port}" >> "${TRIM_TEMP_LOGFILE}"
+        fi
+        exit 1
+    fi
+fi
+
+exit 0
